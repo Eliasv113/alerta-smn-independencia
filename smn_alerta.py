@@ -10,14 +10,13 @@ RSS_URLS = [
     'https://ssl.smn.gob.ar/feeds/avisocorto_GeoRSS.xml',
 ]
 
-# Palabras clave exactas que querés buscar en el contenido de la alerta
+# Palabras clave exactas para buscar en el contenido
 PALABRAS_CLAVE = ['LA RIOJA:INDEPENDENCIA', 'LA RIOJA: PATQUIA', 'LA RIOJA: PATQUÍA']
 
-# Configuración de CallMeBot (reemplaza con tus datos reales)
-TELEFONO = 'TU_TELEFONO'  # Ej: 5493821xxxxxx
-APIKEY = 'TU_APIKEY'
+# Configuración de Telegram
+TELEGRAM_BOT_TOKEN = '8744790579:AAGL5NKfM8j-J2gc4nkTKs3fRAFE-Mfs9vI'
+TELEGRAM_CHANNEL_ID = '-1004449625331'
 
-# Archivo local para no repetir alertas ya enviadas
 HISTORIAL_FILE = 'historial_alertas.json'
 
 
@@ -36,16 +35,25 @@ def guardar_historial(historial):
     json.dump(historial, f, ensure_ascii=False, indent=4)
 
 
-def enviar_whatsapp(mensaje, imagen_url=None):
-  # Enviar texto
-  texto_codificado = requests.utils.quote(mensaje)
-  url_texto = f'https://api.callmebot.com/whatsapp.php?phone={TELEFONO}&text={texto_codificado}&apikey={APIKEY}'
-  requests.get(url_texto)
-
-  # Si el feed incluye alguna imagen asociada, CallMeBot permite enviarla
+def enviar_telegram(mensaje, imagen_url=None):
   if imagen_url:
-    url_img = f'https://api.callmebot.com/whatsapp.php?phone={TELEFONO}&photo={requests.utils.quote(imagen_url)}&apikey={APIKEY}'
-    requests.get(url_img)
+    # Enviar foto con descripción si el feed tiene imagen
+    url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto'
+    payload = {
+        'chat_id': TELEGRAM_CHANNEL_ID,
+        'photo': imagen_url,
+        'caption': mensaje,
+        'parse_mode': 'Markdown',
+    }
+  else:
+    # Enviar solo texto
+    url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
+    payload = {
+        'chat_id': TELEGRAM_CHANNEL_ID,
+        'text': mensaje,
+        'parse_mode': 'Markdown',
+    }
+  requests.post(url, json=payload)
 
 
 def procesar_alertas():
@@ -56,49 +64,37 @@ def procesar_alertas():
     feed = feedparser.parse(url_rss)
 
     for entry in feed.entries:
-      # Identificador único de la alerta
       alerta_id = getattr(
           entry, 'id', getattr(entry, 'link', entry.title)
       )
 
       if alerta_id in historial:
-        continue  # Si ya la procesamos en otra ejecución, la salteamos
+        continue
 
-      # Combinamos título y descripción para buscar las palabras clave
       contenido_completo = (
           f'{entry.title} {getattr(entry, "description", "")}'
       ).upper()
-
-      # Verificamos si contiene alguna de tus palabras clave para Patquía/Independencia
       coincide = any(kw.upper() in contenido_completo for kw in PALABRAS_CLAVE)
 
       if coincide:
-        # Extraer campos detallados
         titulo = entry.title
-
-        # Descripción cruda del feed
         descripcion = getattr(entry, 'description', 'Sin descripción')
 
-        # Buscar si hay imágenes adjuntas en el feed RSS
         imagen_url = None
         if 'media_content' in entry and len(entry.media_content) > 0:
           imagen_url = entry.media_content[0].get('url')
         elif 'enclosures' in entry and len(entry.enclosures) > 0:
           imagen_url = entry.enclosures[0].get('href')
 
-        # Armar el mensaje final formateado tal como pediste
         mensaje = (
             f'🚨 *NUEVA ALERTA SMN - PATQUÍA / INDEPENDENCIA* 🚨\n\n'
             f'*TÍTULO:*\n{titulo}\n\n'
             f'*DESCRIPCIÓN:*\n{descripcion}\n\n'
-            f'📅 *Fecha de emisión:* {datetime.now().strftime("%d-%m-%Y %H:%M")}\n'
-            f'🔗 *Más información oficial:* {entry.link}'
+            f'📅 *Fecha:* {datetime.now().strftime("%d-%m-%Y %H:%M")}\n'
+            f'🔗 *Más info:* {entry.link}'
         )
 
-        # Enviamos por WhatsApp
-        enviar_whatsapp(mensaje, imagen_url)
-
-        # Guardamos en el historial para no repetirla
+        enviar_telegram(mensaje, imagen_url)
         historial.append(alerta_id)
         nuevos_enviados = True
 
