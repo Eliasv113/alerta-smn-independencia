@@ -8,7 +8,7 @@ import requests
 # Única URL de feed configurada
 RSS_URL = 'https://ssl.smn.gob.ar/feeds/avisocorto_GeoRSS.xml'
 
-# ⚠️ RECORDATORIO: Aquí luego cambiarás 'FORMOSA' por tus palabras clave definitivas de La Rioja
+# PALABRAS CLAVE: Dejamos 'FORMOSA' para probar. Luego poné las de Patquía.
 PALABRAS_CLAVE = ['FORMOSA']
 
 # Configuración de Telegram
@@ -48,8 +48,10 @@ def procesar_alertas():
 
   feed = feedparser.parse(RSS_URL)
 
+  # Buscamos todas las alertas que coincidan con la palabra clave
+  alertas_coincidentes = []
+
   for entry in feed.entries:
-    # Usamos el título completo como identificador único para que no se repita nunca
     alerta_id = getattr(entry, 'title', '')
 
     if alerta_id in historial:
@@ -62,39 +64,47 @@ def procesar_alertas():
     coincide = any(kw.upper() in contenido_completo for kw in PALABRAS_CLAVE)
 
     if coincide:
-      # Limpiamos HTML básico
-      limpio = re.sub(r'<p>', '', descripcion_cruda)
-      limpio = re.sub(r'<\/p>', '\n', limpio)
-      limpio = re.sub(r'<\/?b>', '', limpio)
-      limpio = re.sub(r'<img.*?>', '', limpio)
-      descripcion_limpia = limpio.strip()
+      alertas_coincidentes.append(entry)
 
-      # Extraemos mapas en formato link
-      imagenes = re.findall(r'<img[^>]+src="([^">]+)"', descripcion_cruda)
-      links_imagenes = '\n'.join([f'Ver mapa: {img}' for img in imagenes])
+  # Si hay nuevas alertas, procesamos unicamente la MAS RECIENTE (la ultima del feed) para evitar avalanchas
+  if alertas_coincidentes:
+    # Tomamos la ultima entrada coincidente
+    entry = alertas_coincidentes[-1]
+    alerta_id = getattr(entry, 'title', '')
 
-      # Hora local exacta de Argentina (UTC-3)
-      zona_horaria_arg = timezone(timedelta(hours=-3))
-      ahora_arg = datetime.now(zona_horaria_arg)
-      hora_actual = ahora_arg.strftime('%H:%M')
-      fecha_actual = ahora_arg.strftime('%d-%m-%Y')
+    titulo = getattr(entry, 'title', '')
+    descripcion_cruda = getattr(entry, 'description', '')
 
-      # Redacción exacta solicitada
-      mensaje = (
-          f'NUEVA ALERTA SMN\n\n'
-          f'A las {hora_actual} de hoy el Servicio Meteorológico Nacional ha emitido un {titulo}.\n\n'
-          f'{descripcion_limpia}\n\n'
-          f'{links_imagenes}\n\n'
-          f'Fecha: {fecha_actual} {hora_actual}  Más info: {entry.link}'
-      )
+    # Limpiamos HTML básico (incluyendo los <br /> sueltos si los hubiera)
+    limpio = re.sub(r'<p>', '', descripcion_cruda)
+    limpio = re.sub(r'<\/p>', '\n', limpio)
+    limpio = re.sub(r'<br\s*\/?>', '\n', limpio)
+    limpio = re.sub(r'<\/?b>', '', limpio)
+    limpio = re.sub(r'<img.*?>', '', limpio)
+    descripcion_limpia = limpio.strip()
 
-      enviar_telegram_texto(mensaje)
+    # Extraemos mapas en formato link
+    imagenes = re.findall(r'<img[^>]+src="([^">]+)"', descripcion_cruda)
+    links_imagenes = '\n'.join([f'Ver mapa: {img}' for img in imagenes])
 
-      # Guardamos en el historial para evitar futuros duplicados
-      historial.append(alerta_id)
-      nuevos_enviados = True
+    # Hora local exacta de Argentina (UTC-3)
+    zona_horaria_arg = timezone(timedelta(hours=-3))
+    ahora_arg = datetime.now(zona_horaria_arg)
+    hora_actual = ahora_arg.strftime('%H:%M')
+    fecha_actual = ahora_arg.strftime('%d-%m-%Y')
 
-  if nuevos_enviados:
+    # Redacción exacta solicitada
+    mensaje = (
+        f'NUEVA ALERTA SMN\n\n'
+        f'A las {hora_actual} de hoy el Servicio Meteorológico Nacional ha emitido un {titulo}.\n\n'
+        f'{descripcion_limpia}\n\n'
+        f'{links_imagenes}\n\n'
+        f'Fecha: {fecha_actual} {hora_actual}  Más info: {entry.link}'
+    )
+
+    enviar_telegram_texto(mensaje)
+
+    historial.append(alerta_id)
     guardar_historial(historial)
 
 
