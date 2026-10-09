@@ -8,8 +8,7 @@ import requests
 # Única URL de feed configurada
 RSS_URL = 'https://ssl.smn.gob.ar/feeds/avisocorto_GeoRSS.xml'
 
-# PALABRAS CLAVE: Dejamos 'MISIONES' para que puedas probarlo ahora, 
-# luego cambialo por ['LA RIOJA:INDEPENDENCIA', 'LA RIOJA: PATQUIA', 'LA RIOJA: PATQUÍA']
+# PALABRAS CLAVE: 'FORMOSA' para tu prueba actual. Luego poné las de La Rioja.
 PALABRAS_CLAVE = ['FORMOSA']
 
 # Configuración de Telegram
@@ -49,41 +48,39 @@ def procesar_alertas():
   nuevos_enviados = False
 
   feed = feedparser.parse(RSS_URL)
+  print(f'Total de entradas en el GeoRSS: {len(feed.entries)}')
 
   for entry in feed.entries:
     alerta_id = getattr(entry, 'link', entry.title)
 
     if alerta_id in historial:
+      print(f'Alerta ya existente en historial: {entry.title[:30]}...')
       continue
 
+    titulo = getattr(entry, 'title', '')
     descripcion_cruda = getattr(entry, 'description', '')
-    contenido_completo = (f'{entry.title} {descripcion_cruda}').upper()
+    
+    # Unimos todo y lo pasamos a MAYÚSCULAS para garantizar que encuentre la provincia
+    contenido_completo = f'{titulo} {descripcion_cruda}'.upper()
+    
     coincide = any(kw.upper() in contenido_completo for kw in PALABRAS_CLAVE)
+    print(f'Evaluando: {titulo[:30]}... ¿Coincide?: {coincide}')
 
     if coincide:
-      # Extraemos el tipo de alerta del título (ej: TORMENTAS FUERTES...)
-      tipo_alerta = entry.title.strip()
-      
-      # Buscamos las zonas afectadas y los mapas dentro del HTML de la descripción
-      zonas_afectadas = ""
-      match_zonas = re.search(r'<b>(.*?)<\/b>', descripcion_cruda)
-      if match_zonas:
-        # Extraemos texto limpio de departamentos si lo hubiera, o limpiamos HTML básico
-        pass
+      tipo_alerta = titulo.strip()
 
-      # Limpiamos las etiquetas <p> y <b> del HTML de la descripción para armar el bloque central
+      # Limpiamos las etiquetas HTML para el cuerpo del mensaje
       limpio = re.sub(r'<p>', '', descripcion_cruda)
       limpio = re.sub(r'<\/p>', '\n', limpio)
       limpio = re.sub(r'<b>', '*', limpio)
       limpio = re.sub(r'<\/b>', '*', limpio)
-      limpio = re.sub(r'<img.*?>', '', limpio)  # Quitamos las imágenes del texto porque las listamos abajo
+      limpio = re.sub(r'<img.*?>', '', limpio)
       descripcion_limpia = limpio.strip()
 
       # Extraemos las URLs de los mapas
       imagenes = re.findall(r'<img[^>]+src="([^">]+)"', descripcion_cruda)
       links_imagenes = '\n'.join([f'Ver mapa: {img}' for img in imagenes])
 
-      # Hora actual para el formato solicitado
       hora_actual = datetime.now().strftime('%H:%M')
       fecha_actual = datetime.now().strftime('%d-%m-%Y')
 
@@ -96,6 +93,7 @@ def procesar_alertas():
           f'Fecha: {fecha_actual} {hora_actual}  Más info: {entry.link}'
       )
 
+      print('¡Coincidencia encontrada! Enviando a Telegram...')
       enviar_telegram_texto(mensaje)
 
       historial.append(alerta_id)
