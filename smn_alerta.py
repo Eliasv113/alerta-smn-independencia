@@ -1,6 +1,4 @@
 from datetime import datetime
-import json
-import os
 import feedparser
 import re
 import requests
@@ -11,34 +9,12 @@ RSS_URLS = [
     'https://ssl.smn.gob.ar/feeds/avisocorto_GeoRSS.xml',
 ]
 
-# Palabras clave (dejamos 'MISIONES' para tu prueba actual, luego podés dejar solo las de La Rioja)
-PALABRAS_CLAVE = [
-    'LA RIOJA:INDEPENDENCIA',
-    'LA RIOJA: PATQUIA',
-    'LA RIOJA: PATQUÍA',
-    'MISIONES',
-]
+# Palabras clave de prueba
+PALABRAS_CLAVE = ['MISIONES']
 
 # Configuración de Telegram
 TELEGRAM_BOT_TOKEN = '8744790579:AAGL5NKfM8j-J2gc4nkTKs3fRAFE-Mfs9vI'
 TELEGRAM_CHANNEL_ID = '-1004449625331'
-
-HISTORIAL_FILE = 'historial_alertas.json'
-
-
-def cargar_historial():
-  if os.path.exists(HISTORIAL_FILE):
-    with open(HISTORIAL_FILE, 'r', encoding='utf-8') as f:
-      try:
-        return json.load(f)
-      except:
-        return []
-  return []
-
-
-def guardar_historial(historial):
-  with open(HISTORIAL_FILE, 'w', encoding='utf-8') as f:
-    json.dump(historial, f, ensure_ascii=False, indent=4)
 
 
 def limpiar_html(texto_html):
@@ -67,7 +43,8 @@ def enviar_telegram(mensaje, imagenes_urls):
         'caption': mensaje,
         'parse_mode': 'Markdown',
     }
-    requests.post(url, json=payload)
+    r = requests.post(url, json=payload)
+    print(f'Respuesta Telegram Foto: {r.text}')  # Esto imprimirá si hubo error
 
     if len(imagenes_urls) > 1:
       payload_segunda = {
@@ -84,50 +61,42 @@ def enviar_telegram(mensaje, imagenes_urls):
         'text': mensaje,
         'parse_mode': 'Markdown',
     }
-    requests.post(url, json=payload)
+    r = requests.post(url, json=payload)
+    print(f'Respuesta Telegram Texto: {r.text}')
 
 
 def procesar_alertas():
-  historial = cargar_historial()
-  nuevos_enviados = False
-
   for url_rss in RSS_URLS:
     feed = feedparser.parse(url_rss)
+    print(f'Analizando feed: {url_rss} (Total entradas: {len(feed.entries)})')
 
     for entry in feed.entries:
-      alerta_id = getattr(
-          entry, 'id', getattr(entry, 'link', entry.title)
-      )
-
-      if alerta_id in historial:
-        continue
-
       contenido_completo = (
           f'{entry.title} {getattr(entry, "description", "")}'
       ).upper()
       coincide = any(kw.upper() in contenido_completo for kw in PALABRAS_CLAVE)
 
+      print(
+          f'Revisando alerta: {entry.title[:30]}... Coincide con Misiones:'
+          f' {coincide}'
+      )
+
       if coincide:
         titulo = limpiar_html(entry.title)
         descripcion_cruda = getattr(entry, 'description', '')
         descripcion_limpia = limpiar_html(descripcion_cruda)
-
         imagenes = extraer_imagenes(descripcion_cruda)
 
         mensaje = (
-            f'🚨 *NUEVA ALERTA SMN - ZONA DE INTERÉS* 🚨\n\n'
+            f'🚨 *PRUEBA FORZADA - SMN PAT* 🚨\n\n'
             f'*TÍTULO:*\n{titulo}\n\n'
             f'*DESCRIPCIÓN:*\n{descripcion_limpia}\n\n'
-            f'📅 *Fecha de emisión:* {datetime.now().strftime("%d-%m-%Y %H:%M")}\n'
-            f'🔗 *Más información:* {entry.link}'
+            f'📅 *Fecha:* {datetime.now().strftime("%d-%m-%Y %H:%M")}\n'
+            f'🔗 *Más info:* {entry.link}'
         )
 
+        print('Enviando a Telegram...')
         enviar_telegram(mensaje, imagenes)
-        historial.append(alerta_id)
-        nuevos_enviados = True
-
-  if nuevos_enviados:
-    guardar_historial(historial)
 
 
 if __name__ == '__main__':
