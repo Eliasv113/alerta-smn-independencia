@@ -9,7 +9,11 @@ import requests
 RSS_URL = 'https://ssl.smn.gob.ar/feeds/avisocorto_GeoRSS.xml'
 
 # PALABRAS CLAVE: Dejamos 'FORMOSA' para probar. Luego poné las de Patquía.
-PALABRAS_CLAVE = ['FORMOSA']
+PALABRAS_CLAVE = [
+    'LA RIOJA:INDEPENDENCIA',
+    'LA RIOJA: PATQUIA',
+    'LA RIOJA: PATQUÍA',
+]
 
 # Configuración de Telegram
 TELEGRAM_BOT_TOKEN = '8744790579:AAGL5NKfM8j-J2gc4nkTKs3fRAFE-Mfs9vI'
