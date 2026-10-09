@@ -8,7 +8,7 @@ import requests
 # Única URL de feed configurada
 RSS_URL = 'https://ssl.smn.gob.ar/feeds/avisocorto_GeoRSS.xml'
 
-# PALABRAS CLAVE: Dejamos 'FORMOSA' para tu prueba. Luego cambialo por las de Patquía.
+# PALABRAS CLAVE: Dejamos 'FORMOSA' para tu prueba actual.
 PALABRAS_CLAVE = ['FORMOSA']
 
 # Configuración de Telegram
@@ -50,7 +50,8 @@ def procesar_alertas():
   feed = feedparser.parse(RSS_URL)
 
   for entry in feed.entries:
-    alerta_id = getattr(entry, 'link', entry.title)
+    # Usamos el título como ID único ya que el link del SMN es genérico para todas las alertas
+    alerta_id = getattr(entry, 'title', '')
 
     if alerta_id in historial:
       continue
@@ -58,12 +59,12 @@ def procesar_alertas():
     titulo = getattr(entry, 'title', '')
     descripcion_cruda = getattr(entry, 'description', '')
     
-    # Unimos todo y pasamos a MAYÚSCULAS para buscar la provincia sin errores
+    # Pasamos todo a MAYÚSCULAS para garantizar la detección exacta de la provincia
     contenido_completo = f'{titulo} {descripcion_cruda}'.upper()
     coincide = any(kw.upper() in contenido_completo for kw in PALABRAS_CLAVE)
 
     if coincide:
-      # Limpiamos las etiquetas HTML para el cuerpo del mensaje respetando negritas con *
+      # Limpiamos las etiquetas HTML respetando negritas con *
       limpio = re.sub(r'<p>', '', descripcion_cruda)
       limpio = re.sub(r'<\/p>', '\n', limpio)
       limpio = re.sub(r'<b>', '*', limpio)
@@ -78,7 +79,7 @@ def procesar_alertas():
       hora_actual = datetime.now().strftime('%H:%M')
       fecha_actual = datetime.now().strftime('%d-%m-%Y')
 
-      # Redacción exacta y prolija solicitada
+      # Redacción exacta solicitada
       mensaje = (
           f'*NUEVA ALERTA SMN*\n\n'
           f'A las {hora_actual} de hoy el Servicio Meteorológico Nacional ha emitido un *{titulo}*.\n\n'
