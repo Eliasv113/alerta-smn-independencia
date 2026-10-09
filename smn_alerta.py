@@ -11,8 +11,13 @@ RSS_URLS = [
     'https://ssl.smn.gob.ar/feeds/avisocorto_GeoRSS.xml',
 ]
 
-# Palabras clave exactas para buscar en el contenido
-PALABRAS_CLAVE = ['LA RIOJA:INDEPENDENCIA', 'LA RIOJA: PATQUIA', 'LA RIOJA: PATQUÍA', 'MISIONES']
+# Palabras clave (incluimos 'MISIONES' temporalmente para tu prueba actual)
+PALABRAS_CLAVE = [
+    'LA RIOJA:INDEPENDENCIA',
+    'LA RIOJA: PATQUIA',
+    'LA RIOJA: PATQUÍA',
+    'MISIONES',
+]
 
 # Configuración de Telegram
 TELEGRAM_BOT_TOKEN = '8744790579:AAGL5NKfM8j-J2gc4nkTKs3fRAFE-Mfs9vI'
@@ -37,22 +42,19 @@ def guardar_historial(historial):
 
 
 def limpiar_html(texto_html):
-  # Limpia etiquetas HTML básicas para que el texto de Telegram no muestre códigos raros
   limpio = re.sub('<p>', '', texto_html)
   limpio = re.sub('</p>', '\n', limpio)
   limpio = re.sub('<b>', '*', limpio)
   limpio = re.sub('</b>', '*', limpio)
-  limpio = re.sub('<.*?>', '', limpio)  # Remueve cualquier otra etiqueta
+  limpio = re.sub('<.*?>', '', limpio)
   return limpio.strip()
 
 
 def extraer_imagenes(texto_html):
-  # Busca todas las URLs dentro de las etiquetas <img src="..."> en el HTML
   return re.findall(r'<img[^>]+src="([^">]+)"', texto_html)
 
 
 def enviar_telegram(mensaje, imagenes_urls):
-  # Si hay imágenes, enviamos la primera como foto principal adjunta con el texto
   if imagenes_urls and len(imagenes_urls) > 0:
     url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto'
     payload = {
@@ -63,7 +65,6 @@ def enviar_telegram(mensaje, imagenes_urls):
     }
     requests.post(url, json=payload)
 
-    # Si hay una segunda imagen (como pasa en el SMN que manda dos mapas), la enviamos también
     if len(imagenes_urls) > 1:
       payload_segunda = {
           'chat_id': TELEGRAM_CHANNEL_ID,
@@ -73,7 +74,6 @@ def enviar_telegram(mensaje, imagenes_urls):
       }
       requests.post(url, json=payload_segunda)
   else:
-    # Si no hay imágenes, manda solo el texto
     url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
     payload = {
         'chat_id': TELEGRAM_CHANNEL_ID,
@@ -108,12 +108,10 @@ def procesar_alertas():
         descripcion_cruda = getattr(entry, 'description', '')
         descripcion_limpia = limpiar_html(descripcion_cruda)
 
-        # Extraemos las imágenes directamente del HTML de la descripción
         imagenes = extraer_imagenes(descripcion_cruda)
 
-        # Armamos el mensaje final estructurado
         mensaje = (
-            f'🚨 *NUEVA ALERTA SMN - PATQUÍA / INDEPENDENCIA* 🚨\n\n'
+            f'🚨 *NUEVA ALERTA SMN - PATQUÍA / PRUEBA* 🚨\n\n'
             f'*TÍTULO:*\n{titulo}\n\n'
             f'*DESCRIPCIÓN:*\n{descripcion_limpia}\n\n'
             f'📅 *Fecha de emisión:* {datetime.now().strftime("%d-%m-%Y %H:%M")}\n'
