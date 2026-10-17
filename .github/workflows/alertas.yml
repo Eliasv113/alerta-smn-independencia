@@ -35,18 +35,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Revisar RSS y enviar alertas
+      - name: Consultar SMN y enviar alertas
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
         run: python main.py
 
-      - name: Guardar historial actualizado
+      - name: Guardar historial
         run: |
           git add historial_alertas.json
 
           if git diff --cached --quiet; then
-            echo "El historial no tuvo cambios."
+            echo "Sin cambios en el historial."
             exit 0
           fi
 
