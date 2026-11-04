@@ -1,693 +1,507 @@
-
-from datetime import datetime, timezone, timedelta
-from email.utils import parsedate_to_datetime
-from html import unescape
-from pathlib import Path
-import hashlib
-import json
-import logging
 import os
-import re
-import unicodedata
-
-import feedparser
+import json
+import html
+import hashlib
 import requests
+import xml.etree.ElementTree as ET
+
+from shapely.geometry import Polygon, shape
+from shapely.ops import unary_union
+
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+from urllib.parse import urljoin
 
 
-# ============================================================
+# =========================================================z
 # CONFIGURACIÓN
-# ============================================================
+# =========================================================
 
-RSS_URL = "https://ssl.smn.gob.ar/feeds/avisocorto_GeoRSS.xml"
-FUENTE_OFICIAL = "https://www.smn.gob.ar/rss"
+RSS_URL = "https://ssl.smn.gob.ar/CAP/AR.php"
+HISTORIAL_ARCHIVO = "historial_alertas.json"
 
-PALABRAS_CLAVE = [
-    "LA RIOJA:INDEPENDENCIA",
-    "LA RIOJA:PATQUIA",
+# Límite administrativo oficial consultado en la API Georef (Argentina.gob.ar).
+GEOREF_URL = "https://apis.datos.gob.ar/georef/api/departamentos"
+NOMBRE_ZONA = "Departamento de General Alvear, Mendoza"
+DEPARTAMENTO_GEOMETRIA = None
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHANNEL_ID")
+
+ZONA_HORARIA = ZoneInfo("America/Argentina/Buenos_Aires")
+
+# El monitoreo se realiza sobre el polígono completo del departamento.
+
+
+MESES = [
+    "enero", "febrero", "marzo", "abril",
+    "mayo", "junio", "julio", "agosto",
+    "septiembre", "octubre", "noviembre", "diciembre",
 ]
 
-# Coordenadas aproximadas del centro de Patquía.
-# Formato: latitud, longitud.
-PATQUIA_LAT = -30.05
-PATQUIA_LON = -66.88
+TRADUCCIONES = {
+    "Extreme": "Extrema",
+    "Severe": "Severa",
+    "Moderate": "Moderada",
+    "Minor": "Leve",
+    "Unknown": "Desconocida",
+    "Observed": "Observada",
+    "Likely": "Probable",
+    "Possible": "Posible",
+    "Unlikely": "Improbable",
+    "Immediate": "Inmediata",
+    "Expected": "Esperada",
+    "Future": "Futura",
+    "Past": "Pasada",
+}
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")
-
-HISTORIAL_FILE = Path("historial_alertas.json")
-MAX_HISTORIAL = 2000
-TIMEOUT = 25
-MAX_MENSAJE = 4000
-
-ZONA_ARGENTINA = timezone(timedelta(hours=-3))
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
-
-# ============================================================
-# NORMALIZACIÓN DE TEXTO
-# ============================================================
-
-def normalizar(texto):
-    """Ignora tildes, mayúsculas y espacios innecesarios."""
-    texto = unescape(str(texto or ""))
-    texto = unicodedata.normalize("NFD", texto)
-
-    texto = "".join(
-        c for c in texto
-        if unicodedata.category(c) != "Mn"
-    )
-
-    texto = texto.upper()
-    texto = re.sub(r"\s*:\s*", ":", texto)
-    texto = re.sub(r"\s+", " ", texto)
-
-    return texto.strip()
+ICONOS_SEVERIDAD = {
+    "Extreme": "🚨",
+    "Severe": "🔴",
+    "Moderate": "🟠",
+    "Minor": "🟡",
+    "Unknown": "⚪",
+}
 
 
-PALABRAS_NORMALIZADAS = [
-    normalizar(p) for p in PALABRAS_CLAVE
-]
+# =========================================================
+# FUNCIONES XML
+# =========================================================
+
+def nombre_etiqueta(elemento):
+    """Devuelve el nombre de una etiqueta XML sin su espacio de nombres."""
+    return elemento.tag.split("}")[-1]
 
 
-def limpiar_html(texto):
-    """Convierte la descripción HTML del RSS en texto legible."""
-    texto = unescape(str(texto or ""))
+def hijo(elemento, nombre):
+    """Busca el primer hijo directo con el nombre indicado."""
+    if elemento is None:
+        return None
 
-    texto = re.sub(
-        r"<(script|style)\b[^>]*>.*?</\1>",
-        "",
-        texto,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
+    for item in elemento:
+        if nombre_etiqueta(item) == nombre:
+            return item
 
-    texto = re.sub(
-        r"<br\s*/?>|</p>|</div>|</li>",
-        "\n",
-        texto,
-        flags=re.IGNORECASE,
-    )
-
-    texto = re.sub(r"<[^>]+>", " ", texto)
-    texto = unescape(texto)
-    texto = re.sub(r"[ \t]+", " ", texto)
-    texto = re.sub(r" *\n *", "\n", texto)
-    texto = re.sub(r"\n{3,}", "\n\n", texto)
-
-    return texto.strip()
+    return None
 
 
-def obtener_descripcion(entry):
-    """Obtiene la descripción, incluso si viene en content."""
-    descripcion = (
-        entry.get("description", "")
-        or entry.get("summary", "")
-    )
+def texto(elemento, nombre, predeterminado="No especificada"):
+    """Obtiene el texto de un hijo XML."""
+    elemento_hijo = hijo(elemento, nombre)
 
-    if not descripcion and entry.get("content"):
-        descripcion = " ".join(
-            item.get("value", "")
-            for item in entry.get("content", [])
-        )
+    if elemento_hijo is None or not elemento_hijo.text:
+        return predeterminado
 
-    return str(descripcion or "")
+    return elemento_hijo.text.strip()
 
 
-def obtener_titulo(entry):
-    return limpiar_html(entry.get("title", "")) or "Aviso meteorológico"
-
-
-# ============================================================
-# IDENTIFICACIÓN DE AVISOS
-# ============================================================
-
-def identificar_alerta(entry):
-    """
-    Genera un identificador estable.
-    No utiliza el link genérico del RSS como identificador único.
-    """
-    identificador = (
-        entry.get("id")
-        or entry.get("guid")
-        or ""
-    )
-
-    if identificador:
-        return str(identificador).strip()
-
-    titulo = obtener_titulo(entry)
-    descripcion = obtener_descripcion(entry)
-
-    fecha = (
-        entry.get("dc_date")
-        or entry.get("published")
-        or entry.get("updated")
-        or ""
-    )
-
-    contenido = f"{titulo}|{fecha}|{descripcion}"
-
-    return hashlib.sha256(
-        contenido.encode("utf-8")
-    ).hexdigest()
-
-
-# ============================================================
-# HISTORIAL
-# ============================================================
-
-def cargar_historial():
-    if not HISTORIAL_FILE.exists():
+def todos_hijos(elemento, nombre):
+    """Obtiene todos los hijos directos que coinciden con el nombre."""
+    if elemento is None:
         return []
 
+    return [
+        item for item in elemento
+        if nombre_etiqueta(item) == nombre
+    ]
+
+
+# =========================================================
+# FECHAS Y TRADUCCIONES
+# =========================================================
+
+def traducir(valor):
+    return TRADUCCIONES.get(valor, valor or "No especificada")
+
+
+def fecha_argentina(valor):
+    """Convierte una fecha CAP a hora argentina y la muestra en español."""
+    if not valor or valor == "No especificada":
+        return "Sin especificar"
+
     try:
-        with HISTORIAL_FILE.open("r", encoding="utf-8") as archivo:
-            historial = json.load(archivo)
+        valor = valor.strip()
 
-        if not isinstance(historial, list):
-            raise ValueError("El historial no es una lista.")
+        if valor.endswith("Z"):
+            valor = valor[:-1] + "+00:00"
 
-        return [str(item) for item in historial]
+        fecha = datetime.fromisoformat(valor)
 
-    except (OSError, ValueError, json.JSONDecodeError) as error:
-        logging.error("Error leyendo el historial: %s", error)
-        raise
+        # Si la fecha no incluye zona horaria, CAP normalmente debe
+        # interpretarse en UTC para evitar mostrar una hora incorrecta.
+        if fecha.tzinfo is None:
+            fecha = fecha.replace(tzinfo=timezone.utc)
+
+        fecha = fecha.astimezone(ZONA_HORARIA)
+        mes = MESES[fecha.month - 1]
+
+        return f"{fecha.day} de {mes} - {fecha:%H:%M}"
+
+    except (ValueError, TypeError):
+        return valor
+
+
+# =========================================================
+# POLÍGONOS Y LOCALIDADES
+# =========================================================
+
+def leer_poligono(valor):
+    """Convierte vértices CAP "lat,lon lat,lon ..." en pares (lat, lon)."""
+    puntos = []
+
+    if not valor:
+        return puntos
+
+    for par in valor.split():
+        try:
+            partes = par.split(",")
+            if len(partes) != 2:
+                continue
+            latitud = float(partes[0])
+            longitud = float(partes[1])
+            puntos.append((latitud, longitud))
+        except (ValueError, TypeError):
+            continue
+
+    return puntos
+
+
+def cargar_limite_departamento():
+    """Obtiene el polígono oficial del departamento desde la API Georef."""
+    parametros = {
+        "nombre": "General Alvear",
+        "provincia": "Mendoza",
+        "formato": "geojson",
+        "max": 10,
+    }
+
+    print("Descargando el límite geográfico de General Alvear desde Georef...")
+    respuesta = requests.get(GEOREF_URL, params=parametros, timeout=45)
+    respuesta.raise_for_status()
+    datos = respuesta.json()
+
+    # La respuesta GeoJSON habitual es una FeatureCollection.
+    if datos.get("type") == "FeatureCollection":
+        features = datos.get("features", [])
+    elif datos.get("type") == "Feature":
+        features = [datos]
+    else:
+        raise RuntimeError(
+            "Georef no devolvió un GeoJSON reconocible para General Alvear."
+        )
+
+    if not features:
+        raise RuntimeError(
+            "Georef no devolvió el límite de General Alvear, Mendoza. "
+            "Se cancela la ejecución para evitar alertas geográficas incorrectas."
+        )
+
+    geometries = []
+    for feature in features:
+        geometria = feature.get("geometry")
+        if geometria:
+            geometries.append(shape(geometria))
+
+    if not geometries:
+        raise RuntimeError("El GeoJSON de General Alvear no contiene geometrías.")
+
+    limite = unary_union(geometries)
+    if limite.is_empty:
+        raise RuntimeError("El límite geográfico de General Alvear está vacío.")
+
+    if not limite.is_valid:
+        limite = limite.buffer(0)
+
+    if limite.is_empty or not limite.is_valid:
+        raise RuntimeError("No se pudo validar el polígono del departamento.")
+
+    print(f"Límite cargado correctamente: {limite.geom_type}")
+    return limite
+
+
+def localidades_afectadas(area):
+    """Devuelve la zona monitoreada si el CAP intersecta el departamento."""
+    if DEPARTAMENTO_GEOMETRIA is None:
+        raise RuntimeError("No se cargó el límite de General Alvear.")
+
+    for elemento in todos_hijos(area, "polygon"):
+        puntos = leer_poligono(elemento.text)
+        if len(puntos) < 3:
+            continue
+
+        # CAP expresa latitud,longitud; GeoJSON/Shapely utiliza longitud,latitud.
+        poligono_cap = Polygon([(lon, lat) for lat, lon in puntos])
+        if not poligono_cap.is_valid:
+            poligono_cap = poligono_cap.buffer(0)
+
+        if not poligono_cap.is_empty and DEPARTAMENTO_GEOMETRIA.intersects(poligono_cap):
+            return {NOMBRE_ZONA}
+
+    return set()
+
+
+# =========================================================
+# HISTORIAL DE ALERTAS
+# =========================================================
+
+def cargar_historial():
+    if not os.path.exists(HISTORIAL_ARCHIVO):
+        return set()
+
+    try:
+        with open(HISTORIAL_ARCHIVO, "r", encoding="utf-8") as archivo:
+            datos = json.load(archivo)
+
+        if isinstance(datos, list):
+            return set(str(item) for item in datos)
+
+        if isinstance(datos, dict):
+            return set(str(item) for item in datos.get("alertas", []))
+
+        return set()
+
+    except (OSError, json.JSONDecodeError):
+        print("No se pudo leer el historial. Se iniciará vacío.")
+        return set()
 
 
 def guardar_historial(historial):
-    historial = historial[-MAX_HISTORIAL:]
-
-    temporal = HISTORIAL_FILE.with_suffix(".tmp")
-
-    with temporal.open("w", encoding="utf-8") as archivo:
+    with open(HISTORIAL_ARCHIVO, "w", encoding="utf-8") as archivo:
         json.dump(
-            historial,
+            sorted(historial),
             archivo,
             ensure_ascii=False,
             indent=2,
         )
 
-    temporal.replace(HISTORIAL_FILE)
+
+def clave_alerta(identificador, enviado):
+    """Distingue una alerta de sus actualizaciones posteriores."""
+    valor = f"{identificador}|{enviado}"
+    return hashlib.sha256(valor.encode("utf-8")).hexdigest()
 
 
-# ============================================================
-# LECTURA DEL RSS
-# ============================================================
+# =========================================================
+# TELEGRAM
+# =========================================================
 
-def obtener_alertas():
-    respuesta = requests.get(
-        RSS_URL,
-        timeout=TIMEOUT,
-        headers={"User-Agent": "AlertasSMN-Patquia/1.0"},
-    )
-
-    respuesta.raise_for_status()
-
-    feed = feedparser.parse(respuesta.content)
-
-    if feed.bozo:
-        logging.warning(
-            "Advertencia al interpretar el RSS: %s",
-            feed.bozo_exception,
-        )
-
-    if not feed.entries:
+def enviar_telegram(mensaje):
+    if not TOKEN or not CHAT_ID:
         raise RuntimeError(
-            "El RSS no devolvió entradas. Se interrumpe "
-            "la ejecución para evitar un falso resultado vacío."
+            "Faltan los secretos TELEGRAM_BOT_TOKEN o TELEGRAM_CHANNEL_ID."
         )
 
-    return feed.entries
-
-
-# ============================================================
-# DETECCIÓN POR PALABRAS CLAVE
-# ============================================================
-
-def coincide_con_palabras_clave(entry):
-    titulo = obtener_titulo(entry)
-    descripcion = limpiar_html(obtener_descripcion(entry))
-
-    contenido = normalizar(f"{titulo} {descripcion}")
-
-    coincidencias = [
-        palabra
-        for palabra in PALABRAS_NORMALIZADAS
-        if palabra in contenido
-    ]
-
-    if coincidencias:
-        logging.info(
-            "Coincidencia textual: %s",
-            ", ".join(coincidencias),
-        )
-
-    return bool(coincidencias)
-
-
-# ============================================================
-# DETECCIÓN GEOGRÁFICA
-# ============================================================
-
-def obtener_poligono(entry):
-    """
-    Lee las coordenadas GeoRSS del SMN.
-    GeoRSS polygon utiliza pares: latitud longitud.
-    """
-    poligono = (
-        entry.get("georss_polygon")
-        or entry.get("polygon")
-        or ""
-    )
-
-    if isinstance(poligono, list):
-        poligono = " ".join(str(x) for x in poligono)
-
-    numeros = re.findall(
-        r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)",
-        str(poligono),
-    )
-
-    if len(numeros) < 6 or len(numeros) % 2 != 0:
-        return []
-
-    try:
-        valores = [float(n) for n in numeros]
-    except ValueError:
-        return []
-
-    return [
-        (valores[i], valores[i + 1])
-        for i in range(0, len(valores), 2)
-    ]
-
-
-def punto_dentro_poligono(latitud, longitud, poligono):
-    """
-    Comprueba si un punto está dentro de un polígono.
-    El método utiliza el algoritmo ray casting.
-    """
-    if len(poligono) < 3:
-        return False
-
-    dentro = False
-    j = len(poligono) - 1
-
-    for i in range(len(poligono)):
-        lat_i, lon_i = poligono[i]
-        lat_j, lon_j = poligono[j]
-
-        cruza = (
-            (lat_i > latitud) != (lat_j > latitud)
-        ) and (
-            longitud
-            < (lon_j - lon_i)
-            * (latitud - lat_i)
-            / ((lat_j - lat_i) or 1e-15)
-            + lon_i
-        )
-
-        if cruza:
-            dentro = not dentro
-
-        j = i
-
-    return dentro
-
-
-def afecta_patquia(entry):
-    poligono = obtener_poligono(entry)
-
-    if not poligono:
-        logging.debug(
-            "El aviso no contiene un polígono GeoRSS válido."
-        )
-        return False
-
-    resultado = punto_dentro_poligono(
-        PATQUIA_LAT,
-        PATQUIA_LON,
-        poligono,
-    )
-
-    if resultado:
-        logging.info(
-            "El polígono del SMN incluye las coordenadas "
-            "configuradas para Patquía."
-        )
-
-    return resultado
-
-
-# ============================================================
-# DATOS DEL AVISO OFICIAL
-# ============================================================
-
-def extraer_fecha_oficial(entry):
-    """
-    Extrae la fecha y hora del título o de la descripción.
-    Ejemplo: del 09-10-2026 a las 04:09 HOA.
-    """
-    texto = (
-        obtener_titulo(entry)
-        + " "
-        + limpiar_html(obtener_descripcion(entry))
-    )
-
-    patron = (
-        r"(\d{2}-\d{2}-\d{4})"
-        r"\s+a\s+las\s+(\d{2}:\d{2})"
-        r"(?:\s+HOA)?"
-    )
-
-    coincidencia = re.search(
-        patron,
-        texto,
-        flags=re.IGNORECASE,
-    )
-
-    if coincidencia:
-        fecha, hora = coincidencia.groups()
-
-        try:
-            fecha_dt = datetime.strptime(
-                f"{fecha} {hora}",
-                "%d-%m-%Y %H:%M",
-            )
-
-            return fecha_dt.replace(tzinfo=ZONA_ARGENTINA)
-
-        except ValueError:
-            pass
-
-    # Alternativa: fecha de publicación del RSS.
-    for campo in ("dc_date", "published", "updated"):
-        valor = entry.get(campo)
-
-        if not valor:
-            continue
-
-        try:
-            fecha_dt = parsedate_to_datetime(valor)
-
-            if fecha_dt.tzinfo is None:
-                fecha_dt = fecha_dt.replace(tzinfo=timezone.utc)
-
-            return fecha_dt.astimezone(ZONA_ARGENTINA)
-
-        except (TypeError, ValueError, OverflowError):
-            try:
-                fecha_dt = datetime.fromisoformat(
-                    str(valor).replace("Z", "+00:00")
-                )
-
-                if fecha_dt.tzinfo is None:
-                    fecha_dt = fecha_dt.replace(tzinfo=timezone.utc)
-
-                return fecha_dt.astimezone(ZONA_ARGENTINA)
-
-            except (TypeError, ValueError, OverflowError):
-                continue
-
-    return None
-
-
-def extraer_numero_aviso(titulo):
-    coincidencia = re.search(
-        r"\bN[°ºo.]?\s*(\d+)",
-        titulo,
-        flags=re.IGNORECASE,
-    )
-
-    return coincidencia.group(1) if coincidencia else None
-
-
-def extraer_fenomeno(descripcion):
-    """
-    Busca el fenómeno en la frase oficial
-    'por ocurrencia de ...' del SMN.
-    """
-    coincidencia = re.search(
-        r"por\s+ocurrencia\s+de\s+(.*?)(?:</b>|</p>|<br|$)",
-        descripcion,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    if coincidencia:
-        return limpiar_html(coincidencia.group(1)).strip(" .\n")
-
-    texto = limpiar_html(descripcion)
-
-    coincidencia = re.search(
-        r"por\s+ocurrencia\s+de\s+(.+?)(?:\.\s|$)",
-        texto,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    if coincidencia:
-        return coincidencia.group(1).strip(" .\n")
-
-    return "Consultar descripción oficial del aviso."
-
-
-def extraer_zona_afectada(descripcion):
-    """
-    Extrae el texto que sigue a la lista de departamentos.
-    """
-    coincidencia = re.search(
-        r"Afectando\s+parcialmente\s+los\s+siguientes"
-        r"\s+Partidos\s*\|\s*Departamentos\s*:\s*(.*?)"
-        r"(?=<img\b|$)",
-        descripcion,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    if not coincidencia:
-        return ""
-
-    zona = limpiar_html(coincidencia.group(1))
-
-    return re.sub(r"\n{2,}", "\n", zona).strip(" \n:-")
-
-
-def extraer_mapas(descripcion):
-    """Extrae los enlaces a los mapas GIF del aviso."""
-    imagenes = re.findall(
-        r"""<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["']""",
-        descripcion,
-        flags=re.IGNORECASE,
-    )
-
-    resultado = []
-
-    for imagen in imagenes:
-        url = unescape(imagen).strip()
-
-        # El RSS oficial normalmente utiliza URLs HTTPS.
-        if url.startswith("https://"):
-            if url not in resultado:
-                resultado.append(url)
-
-    return resultado
-
-
-# ============================================================
-# CONSTRUCCIÓN DEL MENSAJE PARA TELEGRAM
-# ============================================================
-
-def construir_mensaje(entry, coincidencia_textual, coincidencia_geo):
-    titulo = obtener_titulo(entry)
-    descripcion = obtener_descripcion(entry)
-
-    numero = extraer_numero_aviso(titulo)
-    fecha_oficial = extraer_fecha_oficial(entry)
-    fenomeno = extraer_fenomeno(descripcion)
-    zona = extraer_zona_afectada(descripcion)
-    mapas = extraer_mapas(descripcion)
-
-    ahora = datetime.now(ZONA_ARGENTINA)
-
-    if fecha_oficial:
-        emision = fecha_oficial.strftime("%d/%m/%Y a las %H:%M h")
-    else:
-        emision = "No disponible en el RSS"
-
-    if numero:
-        encabezado = f"Aviso N.º {numero}"
-    else:
-        encabezado = titulo
-
-    lineas = [
-        "⚠️ AVISO METEOROLÓGICO A MUY CORTO PLAZO",
-        "",
-        f"{encabezado} · {emision}",
-        "",
-        "⛈️ FENÓMENO",
-        fenomeno,
-        "",
-        "📍 ZONA AFECTADA",
-    ]
-
-    if zona:
-        lineas.append(zona)
-
-    if coincidencia_geo:
-        lineas.extend([
-            "",
-            "📌 El polígono oficial del aviso alcanza "
-            "las coordenadas configuradas para Patquía.",
-        ])
-
-    if not zona and coincidencia_geo:
-        lineas.append(
-            "Patquía, La Rioja (coincidencia geográfica)."
-        )
-
-    lineas.extend([
-        "",
-        "🕒 EMISIÓN OFICIAL",
-        emision,
-        "",
-        f"🕓 Detectada por el sistema: {ahora.strftime('%d/%m/%Y a las %H:%M')} h",
-    ])
-
-    if mapas:
-        lineas.extend(["", "🗺️ MAPAS DEL AVISO"])
-
-        for i, mapa in enumerate(mapas, start=1):
-            etiqueta = (
-                "Mapa general"
-                if i == 1
-                else "Mapa del aviso"
-                if i == 2
-                else f"Mapa {i}"
-            )
-
-            lineas.append(f"{etiqueta}: {mapa}")
-
-    lineas.extend([
-        "",
-        f"🔗 Fuente oficial: {FUENTE_OFICIAL}",
-    ])
-
-    mensaje = "\n".join(lineas).strip()
-
-    if len(mensaje) > MAX_MENSAJE:
-        mensaje = mensaje[:MAX_MENSAJE - 30] + "\n[Texto recortado]"
-
-    return mensaje
-
-
-# ============================================================
-# ENVÍO A TELEGRAM
-# ============================================================
-
-def enviar_telegram_texto(mensaje):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
-        raise RuntimeError(
-            "Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHANNEL_ID "
-            "en las variables de entorno."
-        )
-
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
     respuesta = requests.post(
         url,
-        json={
-            "chat_id": TELEGRAM_CHANNEL_ID,
+        data={
+            "chat_id": CHAT_ID,
             "text": mensaje,
+            "parse_mode": "HTML",
             "disable_web_page_preview": True,
         },
-        timeout=TIMEOUT,
+        timeout=30,
     )
 
     respuesta.raise_for_status()
-    datos = respuesta.json()
+    resultado = respuesta.json()
 
-    if not datos.get("ok"):
+    if not resultado.get("ok"):
+        raise RuntimeError(f"Telegram rechazó el mensaje: {resultado}")
+
+    print("Mensaje enviado correctamente a Telegram.")
+
+
+def construir_mensaje(alerta, info, localidades):
+    evento = texto(info, "event", "Alerta meteorológica")
+    severidad = texto(info, "severity", "Unknown")
+    certeza = texto(info, "certainty", "Unknown")
+    urgencia = texto(info, "urgency", "Unknown")
+
+    inicio = texto(info, "onset", "")
+    if not inicio or inicio == "No especificada":
+        inicio = texto(info, "effective", "")
+
+    fin = texto(info, "expires", "")
+
+    descripcion = texto(info, "description", "")
+    instrucciones = texto(info, "instruction", "")
+
+    icono = ICONOS_SEVERIDAD.get(severidad, "⚠️")
+
+    lineas = [
+        f"{icono} <b>ALERTA METEOROLÓGICA DEL SMN</b>",
+        "",
+        f"🌦️ <b>Fenómeno:</b> {html.escape(evento)}",
+        f"📍 <b>Zona monitoreada:</b> {html.escape(', '.join(sorted(localidades)))}",
+        f"{icono} <b>Severidad:</b> {html.escape(traducir(severidad))}",
+        f"🎯 <b>Certeza:</b> {html.escape(traducir(certeza))}",
+        f"⏳ <b>Urgencia:</b> {html.escape(traducir(urgencia))}",
+        "",
+        f"🟢 <b>Inicio:</b> {html.escape(fecha_argentina(inicio))}",
+        f"🔚 <b>Fin:</b> {html.escape(fecha_argentina(fin))}",
+    ]
+
+    if descripcion and descripcion != "No especificada":
+        lineas.extend([
+            "",
+            "📝 <b>Descripción:</b>",
+            html.escape(descripcion),
+        ])
+
+    if instrucciones and instrucciones != "No especificada":
+        lineas.extend([
+            "",
+            "🛡️ <b>Recomendaciones:</b>",
+            html.escape(instrucciones),
+        ])
+
+    return "\n".join(lineas)
+
+
+# =========================================================
+# PROCESAMIENTO DE ALERTAS CAP
+# =========================================================
+
+def procesar_cap(contenido, historial, claves_procesadas):
+    raiz = ET.fromstring(contenido)
+
+    if nombre_etiqueta(raiz) != "alert":
+        print("El documento recibido no es un XML CAP.")
+        return
+
+    identificador = texto(raiz, "identifier", "")
+    enviado = texto(raiz, "sent", "")
+
+    if not identificador:
+        print("Se encontró una alerta sin identificador; se omite.")
+        return
+
+    clave = clave_alerta(identificador, enviado)
+
+    if clave in historial or clave in claves_procesadas:
+        print(f"Alerta ya notificada: {identificador}")
+        return
+
+    localidades = set()
+    info_elegida = None
+
+    for info in todos_hijos(raiz, "info"):
+        localidades_info = set()
+
+        for area in todos_hijos(info, "area"):
+            localidades_info.update(localidades_afectadas(area))
+
+        if localidades_info:
+            localidades.update(localidades_info)
+
+            if info_elegida is None:
+                info_elegida = info
+
+    if not localidades or info_elegida is None:
+        print(f"Sin coincidencias geográficas: {identificador}")
+        return
+
+    mensaje = construir_mensaje(raiz, info_elegida, localidades)
+    enviar_telegram(mensaje)
+
+    # Se registra únicamente después de confirmar el envío.
+    historial.add(clave)
+    claves_procesadas.add(clave)
+    guardar_historial(historial)
+
+
+# =========================================================
+# LECTURA DEL FEED DEL SMN
+# =========================================================
+
+def enlaces_cap(contenido):
+    """Extrae los enlaces XML CAP de un RSS o Atom."""
+    raiz = ET.fromstring(contenido)
+
+    if nombre_etiqueta(raiz) == "alert":
+        return [None]
+
+    enlaces = []
+
+    for elemento in raiz.iter():
+        nombre = nombre_etiqueta(elemento)
+
+        if nombre == "item":
+            for item_hijo in elemento:
+                if nombre_etiqueta(item_hijo) == "link" and item_hijo.text:
+                    enlaces.append(item_hijo.text.strip())
+
+        elif nombre == "entry":
+            for item_hijo in elemento:
+                if nombre_etiqueta(item_hijo) == "link":
+                    href = item_hijo.attrib.get("href")
+                    rel = item_hijo.attrib.get("rel", "alternate")
+
+                    if href and rel in ("alternate", "enclosure"):
+                        enlaces.append(href.strip())
+
+    # Conserva el orden y elimina enlaces duplicados.
+    return list(dict.fromkeys(enlaces))
+
+
+def ejecutar():
+    if not TOKEN or not CHAT_ID:
         raise RuntimeError(
-            f"Telegram rechazó el mensaje: {datos}"
+            "Configurá TELEGRAM_BOT_TOKEN y TELEGRAM_CHANNEL_ID "
+            "en los secretos de GitHub Actions."
         )
 
-    return True
+    global DEPARTAMENTO_GEOMETRIA
+    DEPARTAMENTO_GEOMETRIA = cargar_limite_departamento()
 
-
-# ============================================================
-# PROCESAMIENTO PRINCIPAL
-# ============================================================
-
-def procesar_alertas():
     historial = cargar_historial()
-    historial_set = set(historial)
+    claves_procesadas = set()
 
-    entradas = obtener_alertas()
+    print(f"Monitoreando: {NOMBRE_ZONA}")
+    print("Consultando el feed de alertas del SMN...")
 
-    logging.info("Entradas recibidas del SMN: %s", len(entradas))
+    respuesta = requests.get(RSS_URL, timeout=30)
+    respuesta.raise_for_status()
 
-    nuevas = []
+    enlaces = enlaces_cap(respuesta.content)
 
-    for entry in entradas:
-        alerta_id = identificar_alerta(entry)
+    # Permite procesar directamente un XML CAP si el servidor lo devuelve.
+    raiz = ET.fromstring(respuesta.content)
 
-        if not alerta_id or alerta_id in historial_set:
-            continue
-
-        coincide_texto = coincide_con_palabras_clave(entry)
-        coincide_geo = afecta_patquia(entry)
-
-        # Se envía si coincide por texto O por ubicación.
-        if coincide_texto or coincide_geo:
-            nuevas.append(
-                (alerta_id, entry, coincide_texto, coincide_geo)
-            )
-
-    if not nuevas:
-        logging.info(
-            "No hay alertas nuevas para las palabras clave "
-            "ni para el área geográfica configurada."
+    if nombre_etiqueta(raiz) == "alert":
+        procesar_cap(
+            respuesta.content,
+            historial,
+            claves_procesadas,
         )
         return
 
-    logging.info("Alertas nuevas detectadas: %s", len(nuevas))
+    if not enlaces:
+        print("El feed no contiene enlaces CAP reconocibles.")
+        return
 
-    # Los RSS suelen presentar primero los avisos recientes.
-    # Se procesan en orden inverso para evitar saltos.
-    for alerta_id, entry, coincide_texto, coincide_geo in reversed(nuevas):
-        mensaje = construir_mensaje(
-            entry,
-            coincide_texto,
-            coincide_geo,
-        )
-
+    for enlace in enlaces:
         try:
-            enviar_telegram_texto(mensaje)
+            url_cap = urljoin(RSS_URL, enlace)
 
-        except (requests.RequestException, RuntimeError, ValueError) as error:
-            logging.error(
-                "Error al enviar %s: %s",
-                alerta_id,
-                error,
+            print(f"Consultando: {url_cap}")
+
+            respuesta_cap = requests.get(url_cap, timeout=30)
+            respuesta_cap.raise_for_status()
+
+            procesar_cap(
+                respuesta_cap.content,
+                historial,
+                claves_procesadas,
             )
-            # No se registra: se intentará de nuevo más adelante.
-            continue
 
-        # Registrar únicamente después del envío confirmado.
-        historial.append(alerta_id)
-        historial_set.add(alerta_id)
-        guardar_historial(historial)
+        except (requests.RequestException, ET.ParseError, RuntimeError) as error:
+            print(f"Error al procesar {enlace}: {error}")
 
-        logging.info("Alerta enviada: %s", alerta_id)
+    print("Consulta finalizada.")
 
 
 if __name__ == "__main__":
-    try:
-        procesar_alertas()
-    except Exception:
-        logging.exception("Error general al procesar las alertas.")
-        raise
+    ejecutar()
