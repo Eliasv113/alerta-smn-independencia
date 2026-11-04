@@ -222,21 +222,52 @@ def cargar_limite_departamento():
 
 
 def localidades_afectadas(area):
-    """Devuelve la zona monitoreada si el CAP intersecta el departamento."""
+    """Detecta intersección por polygon, circle o geocode CAP."""
     if DEPARTAMENTO_GEOMETRIA is None:
         raise RuntimeError("No se cargó el límite de General Alvear.")
 
+    # 1) Polígonos CAP: cada vértice se expresa como latitud,longitud.
     for elemento in todos_hijos(area, "polygon"):
         puntos = leer_poligono(elemento.text)
         if len(puntos) < 3:
             continue
-
-        # CAP expresa latitud,longitud; GeoJSON/Shapely utiliza longitud,latitud.
         poligono_cap = Polygon([(lon, lat) for lat, lon in puntos])
         if not poligono_cap.is_valid:
             poligono_cap = poligono_cap.buffer(0)
-
         if not poligono_cap.is_empty and DEPARTAMENTO_GEOMETRIA.intersects(poligono_cap):
+            return {NOMBRE_ZONA}
+
+    # 2) Círculos CAP: "latitud,longitud radio_km".
+    # Se aproxima el círculo en grados, ajustando la longitud por latitud.
+    for elemento in todos_hijos(area, "circle"):
+        try:
+            partes = elemento.text.strip().replace(",", " ").split()
+            lat, lon, radio_km = map(float, partes[:3])
+            if radio_km <= 0 or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                continue
+            delta_lat = radio_km / 111.32
+            cos_lat = max(abs(__import__("math").cos(__import__("math").radians(lat))), 0.01)
+            delta_lon = radio_km / (111.32 * cos_lat)
+            circulo_aprox = Polygon([
+                (lon - delta_lon, lat - delta_lat),
+                (lon + delta_lon, lat - delta_lat),
+                (lon + delta_lon, lat + delta_lat),
+                (lon - delta_lon, lat + delta_lat),
+            ])
+            if DEPARTAMENTO_GEOMETRIA.intersects(circulo_aprox):
+                return {NOMBRE_ZONA}
+        except (AttributeError, ValueError, TypeError):
+            print(f"No se pudo interpretar el círculo CAP: {elemento.text!r}")
+
+    # 3) Geocódigos o descripciones administrativas explícitas.
+    area_desc = texto(area, "areaDesc", "").casefold()
+    if "general alvear" in area_desc and ("mendoza" in area_desc or "general alvear" in area_desc):
+        return {NOMBRE_ZONA}
+
+    for geocode in todos_hijos(area, "geocode"):
+        nombre = texto(geocode, "valueName", "").casefold()
+        valor = texto(geocode, "value", "").casefold()
+        if "general alvear" in nombre or "general alvear" in valor:
             return {NOMBRE_ZONA}
 
     return set()
@@ -278,56 +309,60 @@ def extraer_imagenes_de_html(contenido, url_base):
 
 
 def extraer_datos_feed(contenido, url_feed):
-    """Devuelve pares (enlace CAP, imágenes asociadas) de RSS o Atom."""
+    """Lee RSS/Atom, recupera enlaces CAP e imágenes adjuntas al artículo."""
     raiz = ET.fromstring(contenido)
-
     if nombre_etiqueta(raiz) == "alert":
         return [(None, [])]
 
     resultados = []
-
-    for entrada in raiz.iter():
-        tipo_entrada = nombre_etiqueta(entrada)
-        if tipo_entrada not in ("item", "entry"):
-            continue
-
-        enlaces = []
-        imagenes = []
-
+    entradas = [e for e in raiz.iter() if nombre_etiqueta(e) in ("item", "entry")]
+    for entrada in entradas:
+        enlaces, imagenes = [], []
         for elemento in entrada:
             nombre = nombre_etiqueta(elemento)
-
             if nombre == "link":
                 href = elemento.attrib.get("href")
-                rel = elemento.attrib.get("rel", "alternate")
-                if href and rel == "alternate":
-                    enlaces.append(urljoin(url_feed, href.strip()))
+                rel = elemento.attrib.get("rel", "alternate").lower()
+                tipo = elemento.attrib.get("type", "").lower()
+                if href and rel in ("alternate", "related", "enclosure"):
+                    destino = urljoin(url_feed, href.strip())
+                    if tipo.startswith("image/") or rel == "enclosure":
+                        if tipo.startswith("image/") or re.search(r"\.(png|jpe?g|gif|webp)(?:[?#]|$)", destino, re.I):
+                            imagenes.append({"url": destino, "mime_type": tipo})
+                        elif rel != "enclosure":
+                            enlaces.append(destino)
+                    else:
+                        enlaces.append(destino)
                 elif elemento.text and elemento.text.strip():
                     enlaces.append(urljoin(url_feed, elemento.text.strip()))
-
             elif nombre in ("enclosure", "content", "thumbnail"):
-                url = elemento.attrib.get("url") or elemento.attrib.get("href")
+                destino = elemento.attrib.get("url") or elemento.attrib.get("href")
                 mime_type = elemento.attrib.get("type", "")
-                if url and (mime_type.startswith("image/") or nombre in ("thumbnail", "content")):
-                    imagen_url = normalizar_url_imagen(url, url_feed)
+                if destino and (mime_type.startswith("image/") or nombre in ("thumbnail", "content")):
+                    imagen_url = normalizar_url_imagen(destino, url_feed)
                     if imagen_url:
                         imagenes.append({"url": imagen_url, "mime_type": mime_type})
-
-            elif nombre in ("description", "encoded", "content") and elemento.text:
+            elif nombre in ("description", "encoded", "summary") and elemento.text:
                 imagenes.extend(extraer_imagenes_de_html(elemento.text, url_feed))
+            elif nombre == "guid" and elemento.text:
+                guid = elemento.text.strip()
+                if guid.startswith(("http://", "https://")) and re.search(r"\.(xml|cap)(?:[?#]|$)", guid, re.I):
+                    enlaces.append(guid)
 
-        # Evita duplicados y conserva el orden de publicación.
         enlaces = list(dict.fromkeys(enlaces))
-        imagenes_unicas = []
-        vistos = set()
+        imagenes_unicas, vistos = [], set()
         for imagen in imagenes:
             clave = imagen.get("url")
             if clave and clave not in vistos:
                 vistos.add(clave)
                 imagenes_unicas.append(imagen)
-
         for enlace in enlaces:
             resultados.append((enlace, imagenes_unicas))
+
+        # Si el artículo tiene recursos gráficos pero no enlaza un CAP,
+        # se informa en el diagnóstico; no se inventa un documento CAP.
+        if imagenes_unicas and not enlaces:
+            print(f"Artículo RSS con {len(imagenes_unicas)} imagen(es), sin enlace CAP reconocible.")
 
     return resultados
 
@@ -591,53 +626,47 @@ def construir_mensaje(alerta, info, localidades):
 
 def procesar_cap(contenido, historial, claves_procesadas, url_cap=None, imagenes_feed=None):
     raiz = ET.fromstring(contenido)
-
     if nombre_etiqueta(raiz) != "alert":
-        print("El documento recibido no es un XML CAP.")
-        return
+        print(f"El recurso no es CAP XML (raíz: {nombre_etiqueta(raiz)}): {url_cap}")
+        return "no_cap"
 
     identificador = texto(raiz, "identifier", "")
     enviado = texto(raiz, "sent", "")
-
     if not identificador:
-        print("Se encontró una alerta sin identificador; se omite.")
-        return
+        print("CAP sin identificador; se omite.")
+        return "sin_identificador"
 
     clave = clave_alerta(identificador, enviado)
     if clave in historial or clave in claves_procesadas:
         print(f"Alerta ya notificada: {identificador}")
-        return
+        return "duplicada"
 
-    localidades = set()
-    info_elegida = None
-    imagenes_cap = []
-
+    localidades, info_elegida, imagenes_cap = set(), None, []
+    cantidad_areas = 0
     for info in todos_hijos(raiz, "info"):
-        localidades_info = set()
-
         for area in todos_hijos(info, "area"):
-            localidades_info.update(localidades_afectadas(area))
-
-        if localidades_info:
-            localidades.update(localidades_info)
-            imagenes_cap.extend(extraer_imagenes_cap(info, url_cap))
-            if info_elegida is None:
-                info_elegida = info
+            cantidad_areas += 1
+            localidades_info = localidades_afectadas(area)
+            if localidades_info:
+                localidades.update(localidades_info)
+                imagenes_cap.extend(extraer_imagenes_cap(info, url_cap))
+                if info_elegida is None:
+                    info_elegida = info
 
     if not localidades or info_elegida is None:
-        print(f"Sin coincidencias geográficas: {identificador}")
-        return
+        print(f"Sin coincidencias geográficas: {identificador} | áreas CAP analizadas: {cantidad_areas}")
+        return "fuera_de_zona"
 
     imagenes = combinar_imagenes(imagenes_cap, imagenes_feed or [])
+    print(f"ALERTA PARA {NOMBRE_ZONA}: {identificador}")
     print(f"Imágenes asociadas encontradas: {len(imagenes)}")
-
     mensaje = construir_mensaje(raiz, info_elegida, localidades)
     enviar_telegram(mensaje, imagenes)
 
-    # Se registra después de confirmar el envío del mensaje de texto.
     historial.add(clave)
     claves_procesadas.add(clave)
     guardar_historial(historial)
+    return "enviada"
 
 
 # =========================================================
@@ -646,57 +675,61 @@ def procesar_cap(contenido, historial, claves_procesadas, url_cap=None, imagenes
 
 def ejecutar():
     if not TOKEN or not CHAT_ID:
-        raise RuntimeError(
-            "Configurá TELEGRAM_BOT_TOKEN y TELEGRAM_CHANNEL_ID "
-            "en los secretos de GitHub Actions."
-        )
+        raise RuntimeError("Faltan los secretos TELEGRAM_BOT_TOKEN o TELEGRAM_CHANNEL_ID.")
 
     global DEPARTAMENTO_GEOMETRIA
     DEPARTAMENTO_GEOMETRIA = cargar_limite_departamento()
-
     historial = cargar_historial()
     claves_procesadas = set()
+    resumen = {"feeds_ok": 0, "feeds_error": 0, "cap_procesados": 0,
+               "enviadas": 0, "fuera_de_zona": 0, "duplicadas": 0,
+               "no_cap": 0, "sin_identificador": 0}
 
-    print(f"Monitoreando: {NOMBRE_ZONA}")
+    print("=" * 58)
+    print(f"MONITOREO SMN: {NOMBRE_ZONA}")
+    print(f"Historial cargado: {len(historial)} alerta(s)")
+    print("=" * 58)
 
     for url_feed in FEEDS_SMN:
-        print(f"Consultando feed del SMN: {url_feed}")
+        print(f"\n[FEED] Consultando: {url_feed}")
         try:
-            respuesta = requests.get(url_feed, timeout=40)
+            respuesta = requests.get(url_feed, timeout=45, headers={"User-Agent": "SMN-Alertas/1.0"})
             respuesta.raise_for_status()
+            resumen["feeds_ok"] += 1
+            print(f"[FEED] HTTP {respuesta.status_code} | {len(respuesta.content)} bytes")
             elementos = extraer_datos_feed(respuesta.content, url_feed)
-
+            print(f"[FEED] Enlaces CAP/entradas reconocidas: {len(elementos)}")
             if not elementos:
-                print(f"El feed no contiene avisos reconocibles: {url_feed}")
+                print("[FEED] No se encontraron enlaces procesables en este feed.")
                 continue
 
             for url_cap, imagenes_feed in elementos:
                 try:
                     if url_cap is None:
-                        contenido_cap = respuesta.content
-                        url_base_cap = url_feed
+                        contenido_cap, url_base_cap = respuesta.content, url_feed
                     else:
-                        print(f"Consultando CAP: {url_cap}")
-                        respuesta_cap = requests.get(url_cap, timeout=40)
+                        print(f"[CAP] Descargando: {url_cap}")
+                        respuesta_cap = requests.get(url_cap, timeout=45, headers={"User-Agent": "SMN-Alertas/1.0"})
                         respuesta_cap.raise_for_status()
-                        contenido_cap = respuesta_cap.content
-                        url_base_cap = url_cap
+                        contenido_cap, url_base_cap = respuesta_cap.content, url_cap
 
-                    procesar_cap(
-                        contenido_cap,
-                        historial,
-                        claves_procesadas,
-                        url_cap=url_base_cap,
-                        imagenes_feed=imagenes_feed,
-                    )
-
+                    resumen["cap_procesados"] += 1
+                    estado = procesar_cap(contenido_cap, historial, claves_procesadas,
+                                          url_cap=url_base_cap, imagenes_feed=imagenes_feed)
+                    if estado in resumen:
+                        resumen[estado] += 1
                 except (requests.RequestException, ET.ParseError, RuntimeError, ValueError) as error:
-                    print(f"Error al procesar aviso {url_cap or url_feed}: {error}")
-
+                    print(f"[ERROR CAP] {url_cap or url_feed}: {type(error).__name__}: {error}")
         except (requests.RequestException, ET.ParseError, RuntimeError, ValueError) as error:
-            print(f"Error al consultar el feed {url_feed}: {error}")
+            resumen["feeds_error"] += 1
+            print(f"[ERROR FEED] {url_feed}: {type(error).__name__}: {error}")
 
-    print("Consulta de todos los feeds finalizada.")
+    print("\n" + "=" * 58)
+    print("RESUMEN DE EJECUCIÓN")
+    for clave, valor in resumen.items():
+        print(f"{clave}: {valor}")
+    print("Consulta finalizada.")
+    print("=" * 58)
 
 
 if __name__ == "__main__":
